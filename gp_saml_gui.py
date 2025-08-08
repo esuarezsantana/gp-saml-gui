@@ -635,9 +635,11 @@ class SAMLPreLogin:
                     raise SAMLPreLoginException(
                         "{} interface does not exist; specify {} instead".format(
                             self.connection_info.interface.title(),
-                            "--portal"
-                            if self.connection_info.interface == "gateway"
-                            else "--gateway",
+                            (
+                                "--portal"
+                                if self.connection_info.interface == "gateway"
+                                else "--gateway"
+                            ),
                         )
                     )
                 raise SAMLPreLoginException(
@@ -698,6 +700,39 @@ class SAMLPreLogin:
         else:
             raise SAMLPreLoginException("Unknown SAML method (%s)" % method)
         return LoginRequestInfo(method, uri, html)
+
+
+class ContentMetadata:
+
+    def __init__(self, uri, message_headers):
+        "Initialize the HeaderInspector with the given message headers"
+        self.uri = uri
+        content_type_obj = message_headers.get_content_type()
+        self.content_type = content_type_obj[0]
+        self.charset = content_type_obj.params.get("charset")
+        self._headers_dict = {}
+        message_headers.foreach(
+            lambda k, v: operator.setitem(self._headers_dict, k.lower(), v)
+        )
+        self._saml_headers_dict = {
+            h: v
+            for h, v in self._headers_dict.items()
+            if h.startswith("saml-") or h in _SAML_COOKIE_NAME
+        }
+
+    @property
+    def headers(self):
+        "Get the headers dictionary"
+        return self._headers_dict
+
+    @property
+    def saml_headers(self):
+        "Get the SAML headers from the headers dictionary"
+        return self._saml_headers_dict
+
+    def has_saml_headers(self):
+        "Check if the headers contain SAML headers"
+        return bool(self._saml_headers_dict)
 
 
 class SAMLLoginView:
@@ -785,7 +820,7 @@ class SAMLLoginView:
         if message_headers:
             content_type_obj = message_headers.get_content_type()
             content_length = message_headers.get_content_length()
-            content_type = content_type_obj[0]
+            content_type = content_type_obj[0] or "utf-8"
             charset = content_type_obj.params.get("charset")
             content_details = "%d bytes of %s%s for " % (
                 content_length,
@@ -796,22 +831,20 @@ class SAMLLoginView:
             content_details = ""
         logger.debug("[RECEIVE] %sresource %s %s", content_details, method, uri)
 
-    def log_resource_text(
-        self, resource, result, content_type, charset=None, show_headers=None
-    ):
+    def log_resource_text(self, resource, result, metadata):
         "Log the text content of the resource after it has finished loading"
         data = resource.get_data_finish(result)
         content_details = "%d bytes of %s%s for " % (
             len(data),
-            content_type,
-            ("; charset=" + charset) if charset else "",
+            metadata.content_type,
+            ("; charset=" + metadata.charset) if metadata.charset else "",
         )
         logger.info("[DATA   ] %sresource %s", content_details, resource.get_uri())
-        if show_headers:
-            for h, v in show_headers.items():
+        if metadata.headers:
+            for h, v in metadata.headers.items():
                 logger.info("%s: %s", h, v)
-        if charset or content_type.startswith("text/"):
-            logger.info(data.decode(charset or "utf-8"))
+        if metadata.charset or metadata.content_type.startswith("text/"):
+            logger.info(data.decode(metadata.charset or "utf-8"))
 
     def on_load_changed(self, webview, event):
         "Callback for load-changed signal, called when page load event occurs"
@@ -832,40 +865,20 @@ class SAMLLoginView:
         if not response or not message_headers:
             return
 
-        content_type_obj = message_headers.get_content_type()
-
-        headers_dict = {}
-        message_headers.foreach(
-            lambda k, v: operator.setitem(headers_dict, k.lower(), v)
-        )
-        saml_headers_dict = {
-            h: v
-            for h, v in headers_dict.items()
-            if h.startswith("saml-") or h in _SAML_COOKIE_NAME
-        }
-
-        if saml_headers_dict:
-            content_type = content_type_obj[0]
-            charset = content_type_obj.params.get("charset")
-            logger.info("[SAML   ] Got SAML result headers: %r", saml_headers_dict)
+        metadata = ContentMetadata(uri, message_headers)
+        if metadata.has_saml_headers():
+            logger.info("[SAML   ] Got SAML result headers: %r", metadata.saml_headers)
             if logger.isEnabledFor(logging.DEBUG):
-                main_resource.get_data(
-                    None, self.log_resource_text, content_type, charset, headers_dict
-                )
-            self.login_data.update(saml_headers_dict, server=uri_obj.netloc)
-            self.check_done()
+                main_resource.get_data(None, self.log_resource_text, metadata)
+            self.login_data.update(metadata.saml_headers, server=uri_obj.netloc)
+            self.check_done()  # may close the main loop
 
-        if not self.success:
-            logger.debug(
-                "[SAML   ] No headers in response, searching body for xml comments"
-            )
+        # if we have some content, parse it for SAML data
+        main_resource.get_data(None, self.response_callback, metadata)
 
-        main_resource.get_data(None, self.response_callback, content_type_obj)
-
-    def response_callback(self, resource, result, content_type_obj):
+    def response_callback(self, resource, result, metadata):
         "Callback for resource.get_data, called when body content is available"
-        data = resource.get_data_finish(result)
-        content = data.decode(content_type_obj.params.get("charset") or "utf-8")
+        content = resource.get_data_finish(result).decode(metadata.charset or "utf-8")
         saml_info = self.html_parser.saml_info(content)
         logger.debug(
             f"[SAML   ] Finished parsing response body for {resource.get_uri()}"
