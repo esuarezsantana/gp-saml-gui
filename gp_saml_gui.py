@@ -39,12 +39,6 @@ _SAML_AUTH_PATH = {
     "portal": "global-protect/getconfig.esp",
 }
 
-_VERBOSITY_TO_LOGGING_LEVEL = {
-    0: logging.WARNING,
-    1: logging.INFO,
-    2: logging.DEBUG,
-}
-
 _PYTHON_PLATFORM_TO_CLIENT_OS = {
     "linux": "Linux",
     "darwin": "Mac",
@@ -231,16 +225,61 @@ class OpenConnectInfo:
         return "\n".join(f"{k}={quote(v)}" for k, v in self.shell_vars().items())
 
 
-def setup_logger(verbose: int):
-    "Set the verbosity level for the logger"
-    verbosity = min(verbose, max(_VERBOSITY_TO_LOGGING_LEVEL))
-    logging_level = _VERBOSITY_TO_LOGGING_LEVEL.get(verbosity, logging.NOTSET)
-    logger.setLevel(logging_level)
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging_level)
-    formatter = logging.Formatter("%(asctime)-19s [%(levelname)-8s] %(message)s")
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
+class LoggerSetupClass:
+    "Class to set up the logger for the application"
+
+    def __init__(self, verbose: int = 0, logfile: str | None = None):
+        "Initialize the logger setup with the given verbosity level and logfile"
+        self.logfile = logfile
+        # handler will be set to NOTSET logging level
+        self._set_handler()  # sets up self.handler
+        # this log level may be used to configure an external logger
+        self.set_verbosity(verbose)  # sets up self.logging_level
+
+    def set_verbosity(self, verbose: int):
+        "Set the logging level for the logger"
+        _VERBOSITY_TO_LOGGING_LEVEL = {
+            0: logging.WARNING,
+            1: logging.INFO,
+            2: logging.DEBUG,
+        }
+        verbosity = min(verbose, max(_VERBOSITY_TO_LOGGING_LEVEL))
+        self.logging_level = _VERBOSITY_TO_LOGGING_LEVEL.get(verbosity, logging.NOTSET)
+
+    def set_logfile(self, logfile: str | None):
+        "Set the logfile for the logger"
+        if logfile != self.logfile:
+            self.logfile = logfile
+        # close the previous handler if it exists
+        if self.handler:
+            self.handler.close()
+        self._set_handler()
+
+    def _set_handler(self):
+        "Set the handler for the logger"
+        # assume previous handler is closed
+        if self.logfile is None:
+            self.handler = logging.StreamHandler()
+        else:
+            self.handler = logging.FileHandler(self.logfile, mode="a")
+        formatter = logging.Formatter("%(asctime)-19s [%(levelname)-8s] %(message)s")
+        self.handler.setFormatter(formatter)
+        self.handler.setLevel(logging.NOTSET)
+
+    def configure(
+        self, alogger, set_level=False, clear_existing_handlers=False, propagate=None
+    ):
+        "Configure the logger with the given logging level and handler"
+        if propagate is not None:
+            alogger.propagate = propagate
+        if clear_existing_handlers:
+            alogger.handlers.clear()
+        if set_level:
+            alogger.setLevel(self.logging_level)
+        alogger.addHandler(self.handler)
+
+
+LoggerSetup = LoggerSetupClass()
 
 
 def open_external_browser(request_info):
@@ -317,6 +356,11 @@ class CLIOpts:
     def verbose(self):
         "Get the verbosity level from the CLI options"
         return self.args.verbose
+
+    @property
+    def logfile(self):
+        "Get the verbosity level from the CLI options"
+        return self.args.log_file
 
     @property
     def external(self):
@@ -477,6 +521,11 @@ class CLIOpts:
         )
         p.add_argument(
             "--no-proxy", action="store_true", help="Disable system proxy settings"
+        )
+        p.add_argument(
+            "--log-file",
+            default=None,
+            help="Log to the specified file instead of stderr (default is None, which means no file logging)",
         )
         p.add_argument(
             "openconnect_extra",
@@ -1004,7 +1053,11 @@ def main(args=None):
     # parse command line arguments
     opts = CLIOpts(args)
 
-    setup_logger(opts.verbose)
+    LoggerSetup.set_verbosity(opts.verbose)
+    LoggerSetup.set_logfile(opts.logfile)
+    LoggerSetup.configure(
+        logger, clear_existing_handlers=True, set_level=True, propagate=False
+    )
 
     # get SAML request
     prelogin = SAMLPreLogin(opts.gp_connection_info)
