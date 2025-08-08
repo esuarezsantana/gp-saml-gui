@@ -399,6 +399,11 @@ class CLIOpts:
         return self.args.log_file
 
     @property
+    def offscreen(self):
+        "Get the headless mode from the CLI options"
+        return self.args.headless
+
+    @property
     def external(self):
         "Get the external browser flag from the CLI options"
         return self.args.external
@@ -562,6 +567,12 @@ class CLIOpts:
             "--log-file",
             default=None,
             help="Log to the specified file instead of stderr (default is None, which means no file logging)",
+        )
+        p.add_argument(
+            "--headless",
+            action="store_true",
+            default=False,
+            help="Use an offscreen (hidden) GTK window",
         )
         p.add_argument(
             "--web-auth-module-path",
@@ -854,7 +865,7 @@ class WebViewAuthHandler:
 class SAMLLoginView:
     "Class to handle the SAML login view in a GTK window"
 
-    def __init__(self, connection_info):
+    def __init__(self, connection_info, offscreen=False):
         "Initialize the SAML login view with the given connection info"
         self.connection_info = connection_info  # some attrs will be ignored
 
@@ -864,18 +875,22 @@ class SAMLLoginView:
         self.login_data = SAMLLoginData(default_server=self.connection_info.server)
 
         self.html_parser = SAMLHtmlParser()
-        self.webview_init()  # sets 'self.wview'
-        self.window_init()  # sets 'self.window' and connects 'self.wview' to it
+        self.webview_init()  # initialize 'self.wview'
+        # initialize 'self.window' and connect 'self.wview' to it
+        self.window_init(offscreen)
         if (web_auth_subclass := self.connection_info.web_auth_subclass) is None:
             self.external_web_auth = None
         else:
             self.external_web_auth = web_auth_subclass(self.wview)
 
-    def window_init(self):
+    def window_init(self, offscreen=False):
         "Initialize the window and connect the webview to it"
         Gtk.init(None)
-        self.window = Gtk.Window()
-        self.window.resize(500, 500)
+        if offscreen:
+            self.window = Gtk.OffscreenWindow()
+        else:
+            self.window = Gtk.Window()
+        self.window.resize(720, 1280)
         self.window.add(self.wview)
         self.window.show_all()
         self.window.set_title("SAML Login")
@@ -904,6 +919,8 @@ class SAMLLoginView:
 
         settings = self.wview.get_settings()
         settings.set_user_agent(self.connection_info.defined_user_agent)
+        # Just in case we add some gtk widgets to the webview in the future
+        # settings.set_enable_developer_extras(True)
         self.wview.set_settings(settings)
         self.wview.connect("load-changed", self.on_load_changed)
         self.wview.connect("resource-load-started", self.log_resources)
@@ -1153,8 +1170,7 @@ def main(args=None):
 
     # Managed browser window for SAML login
     logger.info("Got SAML %s, opening browser...", login_request_info.method)
-    saml_login = SAMLLoginView(opts.gp_connection_info)
-    # Start interactive GUI loop
+    saml_login = SAMLLoginView(opts.gp_connection_info, offscreen=opts.offscreen)
     saml_login.load(login_request_info.uri, login_request_info.html)
     # At this point the interactive GUI loop has finished
     if saml_login.closed:
