@@ -3,6 +3,7 @@
 import argparse
 import dataclasses
 import gi
+import importlib
 import logging
 import operator
 import requests
@@ -72,6 +73,7 @@ class GPConnectionInfo:
     cookiejar: str
     no_proxy: bool
     retry: int
+    web_auth_module_path: str | None = None
 
     @property
     def defined_user_agent(self):
@@ -84,6 +86,39 @@ class GPConnectionInfo:
         if self.cert is None and self.key is None:
             return None
         return self.cert, self.key
+
+    @property
+    def web_auth_subclass(self):
+        "Get the WebViewAuthHandler object from its module path"
+        if self.web_auth_module_path is None:
+            return None
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "web_auth_module", self.web_auth_module_path
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            logger.info(
+                "Loaded web authentication module '%s'", self.web_auth_module_path
+            )
+        except ImportError as e:
+            logger.error(
+                "Failed to import web authentication module '%s': %s",
+                self.web_auth_module_path,
+                e,
+            )
+        else:
+            # find first subclass of WebViewAuthHandler in the module
+            for name, obj in vars(module).items():
+                if (
+                    isinstance(obj, type)
+                    and issubclass(obj, WebViewAuthHandler)
+                    and obj is not WebViewAuthHandler
+                ):
+                    return obj
+            raise ImportError(
+                f"No WebViewAuthHandler subclass found in module '{self.web_auth_module_path}'"
+            )
 
 
 @dataclasses.dataclass
@@ -349,6 +384,7 @@ class CLIOpts:
                 ),
                 no_proxy=self.args.no_proxy,
                 retry=self.args.retry,
+                web_auth_module_path=self.args.web_auth_module_path,
             )
         return self._gp_connection_info
 
@@ -526,6 +562,11 @@ class CLIOpts:
             "--log-file",
             default=None,
             help="Log to the specified file instead of stderr (default is None, which means no file logging)",
+        )
+        p.add_argument(
+            "--web-auth-module-path",
+            default=None,
+            help="Use the specified authentication module for web authentication",
         )
         p.add_argument(
             "openconnect_extra",
@@ -784,6 +825,32 @@ class ContentMetadata:
         return bool(self._saml_headers_dict)
 
 
+class WebViewAuthHandler:
+    "Class to handle the WebView authentication process"
+
+    # Web auth modules are expected to implement this class.
+    #
+    # Subclasses may use its own logger. This is an example of how to set it up:
+    #
+    #     logger = logging.getLogger(__name__)
+    #     gp_saml_gui.LoggerSetup.configure(logger, ...)
+
+    def __init__(self, wview):
+        "Initialize the WebView authentication handler with the given webview and logger"
+        self.wview = wview
+
+    def response_broker(self, content, metadata):
+        "Broker the response content and metadata for further processing"
+        pass
+
+        # Implement here something like:
+        # if (
+        #     metadata.uri.startswith("https://www.mycorp.com/sso/login")
+        #     and "Introduce your username and password" in content
+        # ):
+        #     ...
+
+
 class SAMLLoginView:
     "Class to handle the SAML login view in a GTK window"
 
@@ -799,6 +866,10 @@ class SAMLLoginView:
         self.html_parser = SAMLHtmlParser()
         self.webview_init()  # sets 'self.wview'
         self.window_init()  # sets 'self.window' and connects 'self.wview' to it
+        if (web_auth_subclass := self.connection_info.web_auth_subclass) is None:
+            self.external_web_auth = None
+        else:
+            self.external_web_auth = web_auth_subclass(self.wview)
 
     def window_init(self):
         "Initialize the window and connect the webview to it"
@@ -933,16 +1004,20 @@ class SAMLLoginView:
             f"[SAML   ] Finished parsing response body for {resource.get_uri()}"
         )
 
+        # Are there any SAML result tags in the response body? Update login data
         if saml_info:
             logger.debug(f"[SAML   ] Got SAML result tags: {saml_info}")
             self.login_data.update(
                 saml_info, server=urlparse(resource.get_uri()).netloc
             )
 
+        # Check whether it is already done.
         if not self.check_done():
             # Work around timing/race condition by retrying check_done after 1 second
+            # check_done may close the main loop
             GLib.timeout_add(1000, self.check_done)
 
+        # Retry if we got a bad SAML auth status
         if (
             saml_info.get("saml-auth-status", "") == "-1"
             and self.retried < self.connection_info.retry
@@ -960,6 +1035,12 @@ class SAMLLoginView:
             login_request_info = prelogin.get_login_request_info()
             logger.info(f"[SAML   ] Got SAML {login_request_info.method}, loading...")
             self.load(login_request_info.uri, login_request_info.html)
+            return
+
+        # Allow external module to handle the response content and metadata
+        if self.external_web_auth:
+            logger.debug("[SAML   ] Passing response to external web auth module")
+            self.external_web_auth.response_broker(content, metadata)
 
     def check_done(self) -> bool:
         "Check if we are done, and if so, quit the main loop"
